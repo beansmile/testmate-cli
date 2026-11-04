@@ -5,7 +5,8 @@
 `testmate` 是 [TestMate](https://testmate.beansmile.ai) 的命令行工具：在终端里查看、认领、完成并发布用户反馈。它是对上游 [`@makethisbetter/cli`](https://github.com/makethisbetter/cli) 的轻量封装（固定版本 1.10.0），所有上游子命令均可原样使用，只是：
 
 - 配置保存在 `~/.testmate/config.json`（不会覆盖你在 makethisbetter.dev 的登录）；
-- `testmate login` 默认连接 `https://testmate.beansmile.ai/api/v1`。
+- `testmate login` 默认连接 `https://testmate.beansmile.ai/api/v1`；
+- 额外提供 TestMate 独有的 QA 验证命令 `feedback verify` / `feedback reject`，`feedback release` 的输出会区分「已关闭」和「进入待验证」（见下文）。
 
 ## 安装
 
@@ -51,6 +52,34 @@ testmate feedback ready demo/FB-12 --summary "修复了登录页在 Safari 下�
 # 4. 部署后，把该提交之前所有 ready 的反馈标记为已发布
 testmate feedback release --project demo --through "$(git rev-parse HEAD)"
 ```
+
+## QA 验证（按项目开启）
+
+在项目设置 → General → QA 验证里打开「关闭前需要 QA 验证」（`requireVerification`）后，`release` 不再直接关闭反馈，而是把它移到 **待验证**（`pending_verification`，界面上显示「待验证」/ Verifying）。由测试同事或 QA 机器人确认后再关闭：
+
+```text
+pending_release → pending_verification → closed(shipped)    # verify
+                          └──────────────→ in_progress       # reject，负责人不变
+```
+
+```bash
+# 发布后，输出会分别列出已关闭和进入待验证的反馈
+testmate feedback release --project demo --through "$(git rev-parse HEAD)"
+# Released: demo/FB-12, demo/FB-13
+#   Closed (shipped): demo/FB-13
+#   Moved to Verifying (waiting for QA): demo/FB-12
+
+# 查看待验证的反馈
+testmate feedback list --project demo --status pending_verification
+
+# 验证通过 → closed(shipped)；--note、--evidence（http(s) 链接）可选
+testmate feedback verify demo/FB-12 --note "Safari 18 上已确认" --evidence https://ci.example.com/runs/42
+
+# 验证失败 → 回到 in_progress（同一负责人），--note 必填
+testmate feedback reject demo/FB-12 --note "导出 CSV 仍然是空文件"
+```
+
+`reject` 之后修好代码，再提交一次带 `Feedback: demo/FB-12` trailer 的 commit，重新 `ready`、`release`（`reject` 之前的提交不再算数）。`release --json` 会额外输出 `closed` 和 `verifying` 两个数组。`verify` / `reject` 只接受处于 `pending_verification` 的反馈，否则返回 409。
 
 其它子命令：`respond`、`decline`、`duplicate`、`reopen`、`archive`、`restore`、`project list/show/create/update` 等，用法见 `testmate <command> --help`。加 `--json` 可输出 JSON。
 
@@ -104,7 +133,7 @@ MCP 服务器（给 Claude Code / Cursor / Codex 用）见 [beansmile/testmate-m
 
 ## English
 
-`testmate` is the command-line client for [TestMate](https://testmate.beansmile.ai). It wraps [`@makethisbetter/cli`](https://github.com/makethisbetter/cli) (pinned to 1.10.0); every upstream subcommand works unchanged. Differences: config lives in `~/.testmate/config.json`, and `testmate login` defaults to `https://testmate.beansmile.ai/api/v1` (override with `--api-url` or `TESTMATE_API_URL`).
+`testmate` is the command-line client for [TestMate](https://testmate.beansmile.ai). It wraps [`@makethisbetter/cli`](https://github.com/makethisbetter/cli) (pinned to 1.10.0); every upstream subcommand works unchanged. Differences: config lives in `~/.testmate/config.json`, `testmate login` defaults to `https://testmate.beansmile.ai/api/v1` (override with `--api-url` or `TESTMATE_API_URL`), and the wrapper adds the TestMate-only QA verification commands below.
 
 ```bash
 npm i -g github:beansmile/testmate-cli      # or: npx -y github:beansmile/testmate-cli <command>
@@ -115,7 +144,24 @@ testmate feedback ready demo/FB-12 --summary "What changed"
 testmate feedback release --project demo --through "$(git rev-parse HEAD)"
 ```
 
+Projects can opt into a QA step (Settings → General → "Require QA verification before closing", `requireVerification`). `release` then moves Feedback to `pending_verification` ("Verifying") instead of closing it, and its output lists which items closed and which moved to Verifying (`--json` adds `closed` and `verifying` arrays). Record the QA result with:
+
+```bash
+testmate feedback list --project demo --status pending_verification
+testmate feedback verify demo/FB-12 [--note "…"] [--evidence <http(s) url>]   # -> closed(shipped)
+testmate feedback reject demo/FB-12 --note "what failed"                       # -> in_progress, same assignee
+```
+
+After a reject, fix it, commit again with the same `Feedback:` trailer, then `ready` and `release` again.
+
 In CI, disable shallow clones (GitLab `GIT_DEPTH: 0`, GitHub Actions `fetch-depth: 0`) and pass the token as `TESTMATE_API_TOKEN`. See the Chinese section above for full CI examples and the environment-variable table.
+
+## Development
+
+```bash
+npm ci
+npm test        # node --test, no extra dependencies
+```
 
 ## License
 

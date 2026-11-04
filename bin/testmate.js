@@ -2,7 +2,10 @@
 "use strict";
 // TestMate CLI: a thin wrapper around the @makethisbetter/cli Go binary that
 // keeps its config in ~/.testmate/config.json and defaults to the TestMate
-// server. Every upstream subcommand is passed through unchanged.
+// server. Upstream subcommands are passed through unchanged, except:
+//   feedback verify / reject   TestMate-only QA verification (lib/verification.js)
+//   feedback release           output split into closed vs Verifying (lib/release.js)
+//   feedback --help            also lists verify / reject (lib/help.js)
 const { spawnSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
@@ -12,6 +15,10 @@ const {
   defaultApiUrl,
   readConfig,
 } = require("../lib/config");
+const { createClient, loadConnection } = require("../lib/api");
+const { runVerification } = require("../lib/verification");
+const { runRelease } = require("../lib/release");
+const { injectFeedbackCommands } = require("../lib/help");
 
 function upstreamPackageDir() {
   return path.dirname(require.resolve("@makethisbetter/cli/package.json"));
@@ -64,7 +71,32 @@ function isHelp(args) {
   return false;
 }
 
-function main() {
+function useColor(stream, env) {
+  return Boolean(stream.isTTY) && !env.NO_COLOR && env.TERM !== "dumb";
+}
+
+function isFeedbackHelp(args) {
+  if (args[0] !== "feedback") return false;
+  const rest = args.slice(1);
+  return rest.length === 0 || (rest.length === 1 && ["help", "--help", "-h"].includes(rest[0]));
+}
+
+// Mirrors the child's outcome. Sets exitCode rather than calling
+// process.exit() so stdout we wrote to a pipe is flushed first.
+function exitLike(result) {
+  if (result.error) {
+    process.stderr.write(result.error.message + "\n");
+    process.exitCode = 1;
+    return;
+  }
+  if (result.signal) {
+    process.kill(process.pid, result.signal);
+    return;
+  }
+  process.exitCode = result.status === null ? 1 : result.status;
+}
+
+async function main() {
   const args = process.argv.slice(2);
   const env = process.env;
   const configPath = applyConfigEnv(env);
@@ -96,6 +128,17 @@ function main() {
     env.MTB_API_TOKEN = env.TESTMATE_API_TOKEN;
   }
 
+  const getClient = () => createClient(loadConnection(configPath, env));
+
+  if (args[0] === "feedback" && (args[1] === "verify" || args[1] === "reject")) {
+    const code = await runVerification(args[1], args.slice(2), {
+      client: getClient,
+      color: useColor(process.stdout, env),
+    });
+    process.exitCode = code;
+    return;
+  }
+
   if (isHelp(args)) process.stdout.write("TestMate CLI (wraps @makethisbetter/cli)\n");
 
   let binary;
@@ -106,16 +149,38 @@ function main() {
     process.exit(1);
   }
 
-  const result = spawnSync(binary, args, { stdio: "inherit", env });
-  if (result.error) {
-    process.stderr.write(result.error.message + "\n");
-    process.exit(1);
-  }
-  if (result.signal) {
-    process.kill(process.pid, result.signal);
+  // Captures stdout, inherits stdin/stderr.
+  const runCaptured = (binArgs) => {
+    const res = spawnSync(binary, binArgs, {
+      stdio: ["inherit", "pipe", "inherit"],
+      env,
+      encoding: "utf8",
+      maxBuffer: 64 * 1024 * 1024,
+    });
+    if (res.error) {
+      process.stderr.write(res.error.message + "\n");
+      process.exit(1);
+    }
+    return res;
+  };
+
+  if (isFeedbackHelp(args)) {
+    const res = runCaptured(args);
+    process.stdout.write(injectFeedbackCommands(res.stdout || ""));
+    exitLike(res);
     return;
   }
-  process.exit(result.status === null ? 1 : result.status);
+
+  if (args[0] === "feedback" && args[1] === "release") {
+    const res = await runRelease(args, { runBinary: runCaptured, getClient });
+    exitLike(res);
+    return;
+  }
+
+  exitLike(spawnSync(binary, args, { stdio: "inherit", env }));
 }
 
-main();
+main().catch((error) => {
+  process.stderr.write((error && error.message ? error.message : String(error)) + "\n");
+  process.exitCode = 1;
+});
